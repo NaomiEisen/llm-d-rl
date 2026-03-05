@@ -2,7 +2,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: ray-bench-script
-  namespace: llm-d-rl
+  namespace: naomi-llmd-rl
 data:
   ray_bench.py: |
     """Ray orchestration harness for orchestration overhead benchmarking.
@@ -364,7 +364,7 @@ apiVersion: batch/v1
 kind: Job
 metadata:
   name: ray-bench
-  namespace: llm-d-rl
+  namespace: naomi-llmd-rl
 spec:
   backoffLimit: 0
   template:
@@ -391,7 +391,7 @@ spec:
             - name: NCCL_DEBUG
               value: "INFO"
             - name: ENGINE_URLS
-              value: "http://vllm-engine-0.vllm-engine.llm-d-rl.svc.cluster.local:8000"
+              value: "http://vllm-engine-0.vllm-engine.naomi-llmd-rl.svc.cluster.local:8000"
             - name: HF_TOKEN
               valueFrom:
                 secretKeyRef:

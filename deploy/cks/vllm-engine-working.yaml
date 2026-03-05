@@ -32,40 +32,51 @@ spec:
         nvidia.com/gpu.present: "true"
       containers:
         - name: vllm
-          image: vllm/vllm-openai:v0.11.0
-          command: ["/bin/sh", "-c"]
-          securityContext:
-            runAsUser: 0
+          image: vllm/vllm-openai:latest
+          command:
+            - vllm
+            - serve
           args:
-          - |
-            python3 -m vllm.entrypoints.openai.api_server \
-            --model Qwen/Qwen3-0.6B \
-            --port 8000 \
-            --gpu-memory-utilization 0.85 \
-            --max-model-len 2048 \
-            --weight-transfer-config '{"backend":"nccl"}'
+            - Qwen/Qwen3-0.6B
+            - --port
+            - "8000"
+            - --served-model-name
+            - Qwen/Qwen3-0.6B
+            - --gpu-memory-utilization=0.85
+            - --max-model-len=2048
+            - --disable-uvicorn-access-log
+            - --weight-transfer-config
+            - '{"backend":"nccl"}'
           env:
             - name: VLLM_SERVER_DEV_MODE
               value: "1"
+            - name: VLLM_LOGGING_LEVEL
+              value: "INFO"
+            - name: HF_HOME
+              value: /model-cache
             - name: HF_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: hf-token
                   key: token
                   optional: true
-            - name: XDG_CACHE_HOME
-              value: /mnt/pvc/hf
-            - name: HF_HOME
-              value: /mnt/pvc/hf
-            - name: VLLM_LOGGING_LEVEL
-              value: "INFO"
+            - name: TRITON_CACHE_DIR
+              value: /.triton-cache
           ports:
             - containerPort: 8000
+              name: vllm
+              protocol: TCP
           volumeMounts:
-            - name: dshm
-              mountPath: /dev/shm
-            - name: model-storage
-              mountPath: /mnt/pvc
+            - mountPath: /.config
+              name: metrics-volume
+            - mountPath: /dev/shm
+              name: shm
+            - mountPath: /.cache
+              name: torch-compile-cache
+            - mountPath: /.triton-cache
+              name: triton-cache
+            - mountPath: /model-cache
+              name: model-storage
           resources:
             limits:
               nvidia.com/gpu: "1"
@@ -77,33 +88,40 @@ spec:
               cpu: "4"
           startupProbe:
             httpGet:
-              path: /health
-              port: 8000
-            initialDelaySeconds: 30
-            periodSeconds: 10
+              path: /v1/models
+              port: vllm
+              scheme: HTTP
+            initialDelaySeconds: 15
+            periodSeconds: 30
             timeoutSeconds: 5
-            failureThreshold: 30
+            failureThreshold: 60
           readinessProbe:
             httpGet:
-              path: /health
-              port: 8000
-            initialDelaySeconds: 120
-            periodSeconds: 10
-            timeoutSeconds: 5
+              path: /v1/models
+              port: vllm
+              scheme: HTTP
+            periodSeconds: 5
+            timeoutSeconds: 2
             failureThreshold: 3
           livenessProbe:
             httpGet:
               path: /health
-              port: 8000
-            initialDelaySeconds: 120
-            periodSeconds: 15
+              port: vllm
+              scheme: HTTP
+            periodSeconds: 10
             timeoutSeconds: 5
             failureThreshold: 3
       volumes:
-        - name: dshm
+        - name: metrics-volume
+          emptyDir: {}
+        - name: torch-compile-cache
+          emptyDir: {}
+        - name: shm
           emptyDir:
             medium: Memory
             sizeLimit: 20Gi
+        - name: triton-cache
+          emptyDir: {}
         - name: model-storage
           emptyDir:
             sizeLimit: 40Gi
@@ -111,3 +129,5 @@ spec:
         - key: "nvidia.com/gpu"
           operator: "Exists"
           effect: "NoSchedule"
+
+# Made with Bob

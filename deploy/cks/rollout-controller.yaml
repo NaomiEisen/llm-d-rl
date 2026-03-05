@@ -2,7 +2,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: rollout-controller
-  namespace: llm-d-rl
+  namespace: naomi-llmd-rl
 spec:
   selector:
     app: rollout-controller
@@ -15,7 +15,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: rollout-controller
-  namespace: llm-d-rl
+  namespace: naomi-llmd-rl
 spec:
   replicas: 1
   selector:
@@ -26,16 +26,14 @@ spec:
       labels:
         app: rollout-controller
     spec:
-      nodeSelector:
-        kubernetes.io/hostname: gc3a4f4
       imagePullSecrets:
         - name: ghcr-creds
       containers:
         - name: controller
-          image: ghcr.io/chcost/llm-d-rl:latest
+          image: ghcr.io/naomieisen/llm-d-rl-controller:testing
           args:
             - "--port=8090"
-            - "--engines=http://vllm-engine-0.vllm-engine.llm-d-rl.svc.cluster.local:8000,http://vllm-engine-1.vllm-engine.llm-d-rl.svc.cluster.local:8000,http://vllm-engine-2.vllm-engine.llm-d-rl.svc.cluster.local:8000,http://vllm-engine-3.vllm-engine.llm-d-rl.svc.cluster.local:8000"
+            - "--engines=http://vllm-engine-0.vllm-engine.naomi-llmd-rl.svc.cluster.local:8000"
             - "--health-check-interval=15s"
           ports:
             - containerPort: 8090

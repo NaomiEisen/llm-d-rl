@@ -2,7 +2,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: llmd-bench-script
-  namespace: llm-d-rl
+  namespace: naomi-llmd-rl
 data:
   llmd_bench.py: |
     """Instrumented llm-d-rl trainer for orchestration overhead benchmarking.
@@ -140,7 +140,7 @@ data:
     def main():
         parser = argparse.ArgumentParser()
         parser.add_argument("--controller-url",
-                            default="http://rollout-controller.llm-d-rl.svc.cluster.local:8090")
+                            default="http://rollout-controller.naomi-llmd-rl.svc.cluster.local:8090")
         parser.add_argument("--model-name", default="meta-llama/Llama-3.1-8B-Instruct")
         parser.add_argument("--master-port", type=int, default=29500)
         parser.add_argument("--warmup-steps", type=int, default=5)
@@ -289,7 +289,7 @@ apiVersion: batch/v1
 kind: Job
 metadata:
   name: llmd-bench
-  namespace: llm-d-rl
+  namespace: naomi-llmd-rl
 spec:
   backoffLimit: 0
   template:
@@ -306,7 +306,7 @@ spec:
           command: ["python3", "/scripts/llmd_bench.py"]
           args:
             - "--controller-url"
-            - "http://rollout-controller.llm-d-rl.svc.cluster.local:8090"
+            - "http://rollout-controller.naomi-llmd-rl.svc.cluster.local:8090"
             - "--model-name"
             - "meta-llama/Llama-3.1-8B-Instruct"
             - "--warmup-steps"

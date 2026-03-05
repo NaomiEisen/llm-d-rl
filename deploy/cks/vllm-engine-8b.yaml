@@ -2,7 +2,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: vllm-engine
-  namespace: llm-d-rl
+  namespace: naomi-llmd-rl
 spec:
   clusterIP: None
   selector:
@@ -16,7 +16,7 @@ apiVersion: apps/v1
 kind: StatefulSet
 metadata:
   name: vllm-engine
-  namespace: llm-d-rl
+  namespace: naomi-llmd-rl
 spec:
   serviceName: vllm-engine
   replicas: 4
