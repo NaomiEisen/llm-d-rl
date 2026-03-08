@@ -1,0 +1,402 @@
+# Complete deployment with Envoy+EPP integration for llm-d-rl
+# This manifest deploys:
+# 1. vLLM engines
+# 2. EPP (Endpoint Picker Plugin) from llm-d-inference-scheduler
+# 3. Envoy gateway with ext-proc
+# 4. Rollout controller with Envoy routing enabled
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: llm-d-rl
+
+---
+# ConfigMap for EPP configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: epp-config
+  namespace: llm-d-rl
+data:
+  config.yaml: |
+    apiVersion: inference.networking.x-k8s.io/v1alpha1
+    kind: EndpointPickerConfig
+    plugins:
+      - type: active-request-scorer
+        parameters:
+          requestTimeout: 300
+      - type: load-aware-scorer
+        parameters:
+          threshold: 10
+      - type: max-score-picker
+      - type: single-profile-handler
+    schedulingProfiles:
+      - name: default
+        plugins:
+          - pluginRef: max-score-picker
+          - pluginRef: active-request-scorer
+            weight: 60
+          - pluginRef: load-aware-scorer
+            weight: 40
+
+---
+# EPP Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: epp
+  namespace: llm-d-rl
+  labels:
+    app: epp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: epp
+  template:
+    metadata:
+      labels:
+        app: epp
+    spec:
+      containers:
+      - name: epp
+        image: ghcr.io/llm-d/llm-d-inference-scheduler/epp:latest
+        args:
+        - --config-file=/etc/epp/config.yaml
+        - --port=9002
+        ports:
+        - containerPort: 9002
+          name: grpc
+          protocol: TCP
+        - containerPort: 9090
+          name: metrics
+          protocol: TCP
+        volumeMounts:
+        - name: config
+          mountPath: /etc/epp
+        resources:
+          requests:
+            cpu: 500m
+            memory: 512Mi
+          limits:
+            cpu: 1000m
+            memory: 1Gi
+      volumes:
+      - name: config
+        configMap:
+          name: epp-config
+
+---
+# EPP Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: epp
+  namespace: llm-d-rl
+spec:
+  selector:
+    app: epp
+  ports:
+  - name: grpc
+    port: 9002
+    targetPort: 9002
+  - name: metrics
+    port: 9090
+    targetPort: 9090
+
+---
+# Envoy ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: envoy-config
+  namespace: llm-d-rl
+data:
+  envoy.yaml: |
+    static_resources:
+      listeners:
+      - name: listener_0
+        address:
+          socket_address:
+            address: 0.0.0.0
+            port_value: 8080
+        filter_chains:
+        - filters:
+          - name: envoy.filters.network.http_connection_manager
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+              stat_prefix: ingress_http
+              codec_type: AUTO
+              route_config:
+                name: local_route
+                virtual_hosts:
+                - name: backend
+                  domains: ["*"]
+                  routes:
+                  - match:
+                      prefix: "/"
+                    route:
+                      cluster: vllm_engines
+              http_filters:
+              - name: envoy.filters.http.ext_proc
+                typed_config:
+                  "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
+                  grpc_service:
+                    envoy_grpc:
+                      cluster_name: epp_cluster
+                  processing_mode:
+                    request_header_mode: SEND
+                    request_body_mode: BUFFERED
+                    response_header_mode: SKIP
+                    response_body_mode: SKIP
+              - name: envoy.filters.http.router
+                typed_config:
+                  "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+      clusters:
+      - name: epp_cluster
+        connect_timeout: 1s
+        type: STRICT_DNS
+        lb_policy: ROUND_ROBIN
+        typed_extension_protocol_options:
+          envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+            "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+            explicit_http_config:
+              http2_protocol_options: {}
+        load_assignment:
+          cluster_name: epp_cluster
+          endpoints:
+          - lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address:
+                    address: epp
+                    port_value: 9002
+      - name: vllm_engines
+        connect_timeout: 5s
+        type: STRICT_DNS
+        lb_policy: ROUND_ROBIN
+        load_assignment:
+          cluster_name: vllm_engines
+          endpoints:
+          - lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address:
+                    address: vllm-engine-0
+                    port_value: 8000
+            - endpoint:
+                address:
+                  socket_address:
+                    address: vllm-engine-1
+                    port_value: 8000
+
+---
+# Envoy Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: envoy-gateway
+  namespace: llm-d-rl
+  labels:
+    app: envoy-gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: envoy-gateway
+  template:
+    metadata:
+      labels:
+        app: envoy-gateway
+    spec:
+      containers:
+      - name: envoy
+        image: envoyproxy/envoy:v1.28-latest
+        args:
+        - -c
+        - /etc/envoy/envoy.yaml
+        ports:
+        - containerPort: 8080
+          name: http
+          protocol: TCP
+        - containerPort: 9901
+          name: admin
+          protocol: TCP
+        volumeMounts:
+        - name: config
+          mountPath: /etc/envoy
+        resources:
+          requests:
+            cpu: 500m
+            memory: 512Mi
+          limits:
+            cpu: 1000m
+            memory: 1Gi
+      volumes:
+      - name: config
+        configMap:
+          name: envoy-config
+
+---
+# Envoy Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: envoy-gateway
+  namespace: llm-d-rl
+spec:
+  selector:
+    app: envoy-gateway
+  ports:
+  - name: http
+    port: 8080
+    targetPort: 8080
+  - name: admin
+    port: 9901
+    targetPort: 9901
+
+---
+# vLLM Engine StatefulSet
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: vllm-engine
+  namespace: llm-d-rl
+spec:
+  serviceName: vllm-engine
+  replicas: 2
+  selector:
+    matchLabels:
+      app: vllm-engine
+  template:
+    metadata:
+      labels:
+        app: vllm-engine
+    spec:
+      containers:
+      - name: vllm
+        image: vllm/vllm-openai:latest
+        env:
+        - name: VLLM_SERVER_DEV_MODE
+          value: "1"
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token
+              key: token
+        args:
+        - --model=meta-llama/Llama-3.1-8B-Instruct
+        - --port=8000
+        - --load-format=dummy
+        - --enforce-eager
+        ports:
+        - containerPort: 8000
+          name: http
+        resources:
+          requests:
+            nvidia.com/gpu: 1
+            cpu: 4
+            memory: 32Gi
+          limits:
+            nvidia.com/gpu: 1
+            cpu: 8
+            memory: 64Gi
+
+---
+# Headless service for vLLM engines
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-engine
+  namespace: llm-d-rl
+spec:
+  clusterIP: None
+  selector:
+    app: vllm-engine
+  ports:
+  - port: 8000
+    targetPort: 8000
+
+---
+# Individual services for each vLLM engine (for direct access)
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-engine-0
+  namespace: llm-d-rl
+spec:
+  selector:
+    app: vllm-engine
+    statefulset.kubernetes.io/pod-name: vllm-engine-0
+  ports:
+  - port: 8000
+    targetPort: 8000
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-engine-1
+  namespace: llm-d-rl
+spec:
+  selector:
+    app: vllm-engine
+    statefulset.kubernetes.io/pod-name: vllm-engine-1
+  ports:
+  - port: 8000
+    targetPort: 8000
+
+---
+# Rollout Controller Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rollout-controller
+  namespace: llm-d-rl
+  labels:
+    app: rollout-controller
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rollout-controller
+  template:
+    metadata:
+      labels:
+        app: rollout-controller
+    spec:
+      containers:
+      - name: controller
+        image: ghcr.io/llm-d/llm-d-rl:latest
+        args:
+        - --port=8090
+        - --engines=http://vllm-engine-0:8000,http://vllm-engine-1:8000
+        - --use-envoy
+        - --envoy-url=http://envoy-gateway:8080
+        ports:
+        - containerPort: 8090
+          name: http
+        resources:
+          requests:
+            cpu: 500m
+            memory: 512Mi
+          limits:
+            cpu: 1000m
+            memory: 1Gi
+
+---
+# Rollout Controller Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: rollout-controller
+  namespace: llm-d-rl
+spec:
+  selector:
+    app: rollout-controller
+  ports:
+  - port: 8090
+    targetPort: 8090
+
+# Made with Bob

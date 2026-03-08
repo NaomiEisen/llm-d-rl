@@ -1,0 +1,61 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rollout-controller
+  namespace: naomi-llmd-rl
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rollout-controller
+  template:
+    metadata:
+      labels:
+        app: rollout-controller
+    spec:
+      containers:
+      - name: controller
+        image: ghcr.io/naomieisen/llm-d-rl-controller-istio@sha256:beda4db57a96a52f4627c12f1a93357e004bfab1884ec000756063da8974680b
+        args:
+        - --port=8090
+        # Direct pod IPs from your cluster (ms-inference-scheduling pods)
+        - --engines=http://10.130.5.22:8000,http://10.129.4.57:8000
+        # Route generation through Istio+EPP
+        - --use-envoy
+        - --envoy-url=http://infra-inference-scheduling-inference-gateway-istio:80
+        ports:
+        - containerPort: 8090
+          name: http
+        livenessProbe:
+          httpGet:
+            path: /v1/health
+            port: http
+          initialDelaySeconds: 10
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /v1/health
+            port: http
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        resources:
+          requests:
+            cpu: 500m
+            memory: 512Mi
+          limits:
+            cpu: 1000m
+            memory: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rollout-controller
+  namespace: naomi-llmd-rl
+spec:
+  selector:
+    app: rollout-controller
+  ports:
+  - port: 8090
+    targetPort: 8090
+    name: http
+
