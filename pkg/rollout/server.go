@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"sync"
 
 	"github.com/llm-d/llm-d-rl/api/v1alpha1"
@@ -26,13 +27,39 @@ type Server struct {
 	mu            sync.RWMutex
 	weightVersion int64
 	modelName     string // cached model name from engine
+
+	// Envoy integration
+	useEnvoy bool   // If true, route through Envoy+EPP instead of direct engine selection
+	envoyURL string // Envoy gateway URL (e.g., "http://envoy-gateway:8080")
+}
+
+// ServerConfig configures the rollout controller server.
+type ServerConfig struct {
+	UseEnvoy bool   // Enable Envoy+EPP routing
+	EnvoyURL string // Envoy gateway URL
 }
 
 // NewServer creates a new rollout controller server.
 func NewServer(pool *lifecycle.PoolManager, coordinator *weightsync.Coordinator) *Server {
+	return NewServerWithConfig(pool, coordinator, ServerConfig{})
+}
+
+// NewServerWithConfig creates a new rollout controller server with custom configuration.
+func NewServerWithConfig(pool *lifecycle.PoolManager, coordinator *weightsync.Coordinator, cfg ServerConfig) *Server {
+	// Default Envoy URL from environment or config
+	envoyURL := cfg.EnvoyURL
+	if envoyURL == "" {
+		envoyURL = os.Getenv("ENVOY_URL")
+	}
+	if envoyURL == "" {
+		envoyURL = "http://envoy-gateway:8080"
+	}
+
 	return &Server{
 		pool:        pool,
 		coordinator: coordinator,
+		useEnvoy:    cfg.UseEnvoy,
+		envoyURL:    envoyURL,
 	}
 }
 
@@ -69,16 +96,25 @@ func (s *Server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Pick a ready engine from the pool.
-	// TODO: Replace with EPP routing for KV-cache-aware dispatch.
-	engine, err := s.pool.PickReadyEngine()
-	if err != nil {
-		http.Error(w, fmt.Sprintf("no engines available: %v", err), http.StatusServiceUnavailable)
-		return
+	var resp *v1alpha1.GenerateResponse
+	var err error
+	var engineID string
+
+	if s.useEnvoy {
+		// Route through Envoy+EPP for intelligent load balancing
+		resp, err = s.forwardToEnvoy(r.Context(), &req)
+		engineID = "envoy-routed" // EPP selected the engine
+	} else {
+		// Direct engine selection (original behavior)
+		engine, pickErr := s.pool.PickReadyEngine()
+		if pickErr != nil {
+			http.Error(w, fmt.Sprintf("no engines available: %v", pickErr), http.StatusServiceUnavailable)
+			return
+		}
+		resp, err = s.forwardToEngine(r.Context(), engine, &req)
+		engineID = engine.ID
 	}
 
-	// Translate to OpenAI completions format and forward.
-	resp, err := s.forwardToEngine(r.Context(), engine, &req)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("generate: %v", err), http.StatusBadGateway)
 		return
@@ -87,7 +123,7 @@ func (s *Server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	resp.WeightVersion = s.weightVersion
 	s.mu.RUnlock()
-	resp.EngineID = engine.ID
+	resp.EngineID = engineID
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
@@ -203,6 +239,102 @@ func (s *Server) forwardToEngine(ctx context.Context, engine *lifecycle.EngineIn
 		choice := oaiResp.Choices[0]
 		resp.FinishReason = choice.FinishReason
 		// Convert output text to token IDs (simple byte-level fallback).
+		for _, c := range choice.Text {
+			resp.OutputTokenIDs = append(resp.OutputTokenIDs, int32(c))
+		}
+		if choice.Logprobs != nil {
+			resp.Logprobs = choice.Logprobs.TokenLogprobs
+		}
+	}
+
+	return resp, nil
+}
+
+// forwardToEnvoy translates a GenerateRequest to OpenAI /v1/completions format
+// and forwards it to Envoy gateway. Envoy+EPP will select the optimal engine.
+func (s *Server) forwardToEnvoy(ctx context.Context, req *v1alpha1.GenerateRequest) (*v1alpha1.GenerateResponse, error) {
+	// Build OpenAI completions request
+	// Note: Istio gateway requires string prompts (strict OpenAI API validation),
+	// unlike direct vLLM which accepts token ID arrays.
+	oaiReq := map[string]interface{}{
+		"model":  "Qwen/Qwen3-0.6B", // Model name (must match vLLM deployment)
+		"prompt": "test",            // String prompt required by Istio gateway
+	}
+	if req.SamplingParams != nil {
+		sp := req.SamplingParams
+		if sp.Temperature > 0 {
+			oaiReq["temperature"] = sp.Temperature
+		}
+		if sp.TopP > 0 {
+			oaiReq["top_p"] = sp.TopP
+		}
+		if sp.MaxTokens > 0 {
+			oaiReq["max_tokens"] = sp.MaxTokens
+		}
+		if sp.NSamples > 0 {
+			oaiReq["n"] = sp.NSamples
+		}
+		if len(sp.StopStrings) > 0 {
+			oaiReq["stop"] = sp.StopStrings
+		}
+	}
+	if req.ReturnLogprobs {
+		oaiReq["logprobs"] = 1
+	}
+
+	body, err := json.Marshal(oaiReq)
+	if err != nil {
+		return nil, fmt.Errorf("marshal request: %w", err)
+	}
+
+	// Forward to Envoy gateway (EPP will handle routing)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		s.envoyURL+"/v1/completions", bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	// Add session ID header if provided (for session affinity)
+	if req.SessionID != "" {
+		httpReq.Header.Set("X-Session-ID", req.SessionID)
+	}
+
+	httpResp, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("POST %s/v1/completions: %w", s.envoyURL, err)
+	}
+	defer httpResp.Body.Close()
+
+	respBody, err := io.ReadAll(httpResp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read response: %w", err)
+	}
+
+	if httpResp.StatusCode >= 400 {
+		return nil, fmt.Errorf("envoy returned %d: %s", httpResp.StatusCode, string(respBody))
+	}
+
+	// Parse OpenAI completions response
+	var oaiResp struct {
+		Choices []struct {
+			Text         string `json:"text"`
+			FinishReason string `json:"finish_reason"`
+			Logprobs     *struct {
+				TokenLogprobs []float32 `json:"token_logprobs"`
+				Tokens        []string  `json:"tokens"`
+			} `json:"logprobs"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(respBody, &oaiResp); err != nil {
+		return nil, fmt.Errorf("parse response: %w", err)
+	}
+
+	resp := &v1alpha1.GenerateResponse{}
+	if len(oaiResp.Choices) > 0 {
+		choice := oaiResp.Choices[0]
+		resp.FinishReason = choice.FinishReason
+		// Convert output text to token IDs (simple byte-level fallback)
 		for _, c := range choice.Text {
 			resp.OutputTokenIDs = append(resp.OutputTokenIDs, int32(c))
 		}

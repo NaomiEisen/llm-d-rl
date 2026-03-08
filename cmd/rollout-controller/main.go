@@ -38,6 +38,8 @@ func main() {
 		healthCheckInterval = flag.Duration("health-check-interval", 30*time.Second, "Interval between engine health checks")
 		engines             = flag.String("engines", "", "Comma-separated list of engine URLs (e.g., http://localhost:8000,http://localhost:8001)")
 		simulateLifecycle   = flag.Bool("simulate-lifecycle", false, "No-op lifecycle operations (pause, sleep, weight sync) for GPU-free demos with llm-d-inference-sim")
+		useEnvoy            = flag.Bool("use-envoy", false, "Route generation requests through Envoy+EPP for intelligent load balancing")
+		envoyURL            = flag.String("envoy-url", "", "Envoy gateway URL (default: http://envoy-gateway:8080 or ENVOY_URL env var)")
 		showVersion         = flag.Bool("version", false, "Print version and exit")
 	)
 	flag.Parse()
@@ -48,6 +50,15 @@ func main() {
 	}
 
 	log.Printf("llm-d rollout controller %s starting on port %d", version, *port)
+
+	if *useEnvoy {
+		log.Printf("Envoy routing enabled: requests will be routed through Envoy+EPP")
+		if *envoyURL != "" {
+			log.Printf("Envoy URL: %s", *envoyURL)
+		} else {
+			log.Printf("Envoy URL: will use ENVOY_URL env var or default (http://envoy-gateway:8080)")
+		}
+	}
 
 	// Initialize components
 	coordinator := weightsync.NewCoordinator()
@@ -86,7 +97,11 @@ func main() {
 		}
 	}
 
-	server := rollout.NewServer(poolManager, coordinator)
+	// Create server with Envoy configuration
+	server := rollout.NewServerWithConfig(poolManager, coordinator, rollout.ServerConfig{
+		UseEnvoy: *useEnvoy,
+		EnvoyURL: *envoyURL,
+	})
 
 	// Start health check loop
 	ctx, cancel := context.WithCancel(context.Background())

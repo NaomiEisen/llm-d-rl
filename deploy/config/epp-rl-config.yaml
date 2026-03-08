@@ -1,0 +1,34 @@
+# EPP Configuration for RL Training
+# This config uses load-based scoring only (no KV cache dependency)
+# Compatible with weight updates and cache clearing during RL training
+
+apiVersion: inference.networking.x-k8s.io/v1alpha1
+kind: EndpointPickerConfig
+
+plugins:
+  # Active request scorer - tracks in-flight requests with TTL
+  - type: active-request-scorer
+    parameters:
+      requestTimeout: 300  # 5 minutes timeout for RL generation
+
+  # Load-aware scorer - fallback based on queue depth
+  - type: load-aware-scorer
+    parameters:
+      threshold: 10  # Max queue depth before pod is overloaded
+
+  # Max score picker - selects pod with highest weighted score
+  - type: max-score-picker
+
+  # Single profile handler - no P/D disaggregation
+  - type: single-profile-handler
+
+schedulingProfiles:
+  - name: default
+    plugins:
+      - pluginRef: max-score-picker
+      - pluginRef: active-request-scorer
+        weight: 60  # Primary: prefer pods with fewer active requests
+      - pluginRef: load-aware-scorer
+        weight: 40  # Secondary: consider queue depth
+
+# Made with Bob
