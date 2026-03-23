@@ -28,9 +28,9 @@ type Server struct {
 	// When empty, requests are dispatched directly to an engine from the pool.
 	eppURL string
 
-	mu               sync.RWMutex
-	weightVersion    int64
-	cachedModelName  string // lazily populated on first /v1/models query
+	mu              sync.RWMutex
+	weightVersion   int64
+	cachedModelName string // lazily populated on first /v1/models query
 }
 
 // NewServer creates a new rollout controller server.
@@ -168,10 +168,19 @@ func (s *Server) buildOAIRequest(ctx context.Context, baseURL string, req *v1alp
 		"model": s.discoverModelName(ctx, baseURL),
 	}
 	if eppMode {
-		// Dummy string prompt for the EPP body parser; vLLM ignores it
-		// when prompt_token_ids is present.
-		oaiReq["prompt"] = "tokens"
+		// Send the decoded prompt text so EPP can parse and route correctly,
+		// and vLLM 0.16+ generates from the actual prompt.
+		// Also send prompt_token_ids for forward-compatibility with vLLM
+		// versions that prefer token IDs over re-tokenizing text.
+		// Falls back to "tokens" if no text was provided (legacy behaviour).
+		if req.Prompt != "" {
+			oaiReq["prompt"] = req.Prompt
+		} else {
+			oaiReq["prompt"] = "tokens"
+		}
+		if req.PromptTokenIDs != nil {
 		oaiReq["prompt_token_ids"] = req.PromptTokenIDs
+	}
 	} else {
 		// Direct-to-engine: vLLM accepts prompt as an int array natively.
 		oaiReq["prompt"] = req.PromptTokenIDs
@@ -218,9 +227,7 @@ func parseOAIResponse(respBody []byte) (*v1alpha1.GenerateResponse, error) {
 	if len(oaiResp.Choices) > 0 {
 		choice := oaiResp.Choices[0]
 		resp.FinishReason = choice.FinishReason
-		for _, c := range choice.Text {
-			resp.OutputTokenIDs = append(resp.OutputTokenIDs, int32(c))
-		}
+		resp.Text = choice.Text
 		if choice.Logprobs != nil {
 			resp.Logprobs = choice.Logprobs.TokenLogprobs
 		}

@@ -69,6 +69,11 @@ const (
 
 // GenerateRequest is a request to generate token sequences from prompts.
 type GenerateRequest struct {
+	// Prompt is the decoded text of the prompt. When set, it is used as the
+	// "prompt" field forwarded to the EPP/vLLM instead of the dummy "tokens"
+	// string, enabling correct KV-cache routing and generation.
+	Prompt string `json:"prompt,omitempty"`
+
 	// PromptTokenIDs is the tokenized input prompt.
 	PromptTokenIDs []int32 `json:"prompt_token_ids"`
 
@@ -89,8 +94,9 @@ type GenerateRequest struct {
 
 // GenerateResponse contains the output of a generation request.
 type GenerateResponse struct {
-	// OutputTokenIDs is the generated token sequence.
-	OutputTokenIDs []int32 `json:"output_token_ids"`
+	// Text is the generated text as returned by vLLM. The caller (Python)
+	// is responsible for tokenizing this into token IDs.
+	Text string `json:"text,omitempty"`
 
 	// Logprobs contains per-token log probabilities (if requested).
 	Logprobs []float32 `json:"logprobs,omitempty"`

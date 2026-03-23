@@ -93,7 +93,7 @@ class RolloutControllerClient:
     # --- Generation ---
 
     def generate(self, prompt_token_ids: list[int], max_tokens: int = 32,
-                 temperature: float = 0.7, **kwargs) -> dict:
+                 temperature: float = 0.7, prompt: str | None = None, **kwargs) -> dict:
         body: dict[str, Any] = {
             "prompt_token_ids": prompt_token_ids,
             "sampling_params": {
@@ -102,6 +102,8 @@ class RolloutControllerClient:
                 **kwargs,
             },
         }
+        if prompt is not None:
+            body["prompt"] = prompt
         return self._post("/v1/generate", body)
 
     # --- Weight Management ---
