@@ -42,7 +42,10 @@ import logging
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import random
+
 import numpy as np
+import ray
 import torch
 from tensordict import TensorDict
 
@@ -82,10 +85,12 @@ class LlmdAgentLoopManager:
         replicas = manager.rollout_replicas   # empty list — no veRL-managed pods
     """
 
-    def __init__(self, config, client: RolloutControllerClient, tokenizer=None):
+    def __init__(self, config, client: RolloutControllerClient, tokenizer=None,
+                 reward_loop_worker_handles=None):
         self.config = config
         self.client = client
         self.tokenizer = tokenizer
+        self.reward_loop_worker_handles = reward_loop_worker_handles
         # Empty — LlmdVerlCheckpointEngineManager ignores replicas anyway
         self.rollout_replicas: list = []
 
@@ -117,7 +122,8 @@ class LlmdAgentLoopManager:
         except Exception as exc:
             logger.warning("[LLMD] Could not load tokenizer: %s", exc)
 
-        return cls(config, client, tokenizer)
+        return cls(config, client, tokenizer,
+                   reward_loop_worker_handles=reward_loop_worker_handles)
 
     # ------------------------------------------------------------------
     # veRL interface — generation
@@ -264,7 +270,7 @@ class LlmdAgentLoopManager:
         # full sequence = original padded prompt + response
         full_ids = torch.cat([input_ids_tensor, resp_ids], dim=1)       # [B, P+R]
         full_mask = torch.cat([attn_mask_tensor, resp_mask], dim=1)     # [B, P+R]
-        position_ids = compute_position_id_with_mask(full_mask)            # [B, P+R]
+        position_ids = compute_position_id_with_mask(full_mask)         # [B, P+R]
 
         # ------------------------------------------------------------------
         # 4. Build output DataProto
@@ -298,15 +304,60 @@ class LlmdAgentLoopManager:
         if "multi_modal_inputs" not in out_non_tensor:
             out_non_tensor["multi_modal_inputs"] = np.array([{} for _ in range(B)], dtype=object)
 
-        # The trainer's extract_reward() unconditionally reads batch["rm_scores"].
-        # Provide a zero tensor — actual scoring is done later by the reward
-        # manager (e.g. rule-based rewards in core_algos.py for GSM8K).
-        out_batch["rm_scores"] = torch.zeros_like(resp_ids, dtype=torch.float32)
+        # ------------------------------------------------------------------
+        # 5. Compute reward scores via reward_loop_workers
+        #
+        # The trainer passes reward_loop_worker_handles (Ray actor handles)
+        # that run the reward function (e.g. GSM8K regex scoring).  We call
+        # compute_score.remote() per sample, same as veRL's AgentLoopBase.
+        # Mirrored from agent_loop.py:759-828.
+        # ------------------------------------------------------------------
+        if self.reward_loop_worker_handles:
+            futures = []
+            for i in range(B):
+                item_batch = TensorDict(
+                    {
+                        "prompts":        input_ids_tensor[i : i + 1],
+                        "responses":      resp_ids[i : i + 1],
+                        "input_ids":      full_ids[i : i + 1],
+                        "attention_mask": full_mask[i : i + 1],
+                        "position_ids":   position_ids[i : i + 1],
+                        "response_mask":  resp_mask[i : i + 1],
+                    },
+                    batch_size=[1],
+                )
+                item_non_tensor = {k: np.array([v[i]]) for k, v in out_non_tensor.items()}
+                item_non_tensor["__num_turns__"] = np.array([2], dtype=np.int32)
+                item_non_tensor["tool_extra_fields"] = np.array([{}], dtype=object)
+                item_data = DataProto(batch=item_batch, non_tensor_batch=item_non_tensor)
+                handle = random.choice(self.reward_loop_worker_handles)
+                futures.append(handle.compute_score.remote(item_data))
+
+            results = ray.get(futures)
+            scores = [r["reward_score"] for r in results]
+
+            # Place scalar score at last valid response token (same as veRL's AgentLoopBase)
+            prompt_len = input_ids_tensor.shape[1]
+            valid_resp_lens = out_batch["attention_mask"][:, prompt_len:].sum(dim=1)
+            rm_scores = torch.zeros_like(resp_ids, dtype=torch.float32)
+            for i, (score, vlen) in enumerate(zip(scores, valid_resp_lens)):
+                if int(vlen.item()) > 0:
+                    rm_scores[i, int(vlen.item()) - 1] = float(score)
+            out_batch["rm_scores"] = rm_scores
+
+            reward_extra_keys = list(results[0].get("reward_extra_info", {}).keys())
+            for key in reward_extra_keys:
+                out_non_tensor[key] = np.array([r["reward_extra_info"][key] for r in results])
+            timing["llmd/reward"] = time.perf_counter() - t_end
+        else:
+            out_batch["rm_scores"] = torch.zeros_like(resp_ids, dtype=torch.float32)
+            reward_extra_keys = []
 
         output = DataProto(
             batch=out_batch,
             non_tensor_batch=out_non_tensor,
-            meta_info={**prompts.meta_info, "timing": timing},
+            meta_info={**prompts.meta_info, "timing": timing,
+                       "reward_extra_keys": reward_extra_keys},
         )
 
         logger.info(
