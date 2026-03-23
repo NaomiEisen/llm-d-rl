@@ -1,0 +1,260 @@
+# veRL PPO training config — llm-d rollout backend
+#
+# Overrides the base ppo_trainer config with:
+#   1. agent_loop_manager_class  → LlmdAgentLoopManager   (HTTP generation)
+#   2. checkpoint_manager_class  → LlmdVerlCheckpointEngineManager (NCCL weight sync)
+#   3. checkpoint_engine.backend → "llmd"                  (custom engine on workers)
+#   4. checkpoint_engine.backend_module                    (imports llmd backend on workers)
+#
+# Inference (vLLM pods) is owned entirely by the llm-d controller — veRL does
+# not spawn any rollout actors.  The FSDP training workers broadcast weights
+# directly to the vLLM pods via NCCL after each policy update.
+#
+# Usage (from the verl repo root, run on KubeRay head pod):
+#   python -m verl.trainer.main_ppo \
+#       --config-path /path/to/llm-d-rl/deploy/verl \
+#       --config-name ppo_llmd \
+#       actor_rollout_ref.model.path=Qwen/Qwen2.5-0.5B-Instruct \
+#       data.train_files=/tmp/verl/data/gsm8k/train.parquet \
+#       data.val_files=/tmp/verl/data/gsm8k/test.parquet
+
+hydra:
+  searchpath:
+    # point at the built-in veRL config tree (installed at /opt/verl)
+    - file:///opt/verl/verl/trainer/config
+  run:
+    dir: /tmp/verl/hydra_outputs
+
+defaults:
+  - ppo_trainer   # base veRL PPO config
+  - _self_        # this file's overrides win
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Data
+# ──────────────────────────────────────────────────────────────────────────────
+data:
+  tokenizer: null
+  train_files: /tmp/verl/data/gsm8k/train.parquet
+  val_files: /tmp/verl/data/gsm8k/test.parquet
+  prompt_key: prompt
+  max_prompt_length: 512
+  max_response_length: 512
+  train_batch_size: 256
+  return_raw_input_ids: False
+  return_raw_chat: False
+  shuffle: True
+  seed: 42
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Actor / Rollout / Ref
+# ──────────────────────────────────────────────────────────────────────────────
+actor_rollout_ref:
+  hybrid_engine: True    # required by veRL trainer; llm-d still owns inference via agent_loop_manager_class
+
+  model:
+    path: Qwen/Qwen2.5-0.5B-Instruct
+    external_lib: null
+    override_config: {}
+    enable_gradient_checkpointing: True
+    use_remove_padding: False
+
+  actor:
+    strategy: fsdp
+    ppo_mini_batch_size: 64
+    ppo_micro_batch_size_per_gpu: 4
+    use_dynamic_bsz: False
+    ppo_max_token_len_per_gpu: 16384
+    grad_clip: 1.0
+    clip_ratio: 0.2
+    entropy_coeff: 0.0
+    use_kl_loss: False
+    ppo_epochs: 1
+    shuffle: False
+    ulysses_sequence_parallel_size: 1
+    optim:
+      lr: 1e-6
+      lr_warmup_steps: -1
+      lr_warmup_steps_ratio: 0.0
+      min_lr_ratio: null
+      lr_scheduler_type: constant
+      total_training_steps: -1
+    fsdp_config:
+      wrap_policy:
+        min_num_params: 0
+      param_offload: False
+      optimizer_offload: False
+      fsdp_size: -1
+
+  ref:
+    fsdp_config:
+      param_offload: False
+      wrap_policy:
+        min_num_params: 0
+    log_prob_micro_batch_size_per_gpu: null
+    log_prob_use_dynamic_bsz: ${actor_rollout_ref.actor.use_dynamic_bsz}
+    log_prob_max_token_len_per_gpu: ${actor_rollout_ref.actor.ppo_max_token_len_per_gpu}
+    ulysses_sequence_parallel_size: 1
+
+  rollout:
+    # ── llm-d plugin hooks ────────────────────────────────────────────────────
+    # Routes update_weights() calls through the llm-d NCCL + HTTP weight sync
+    # path instead of veRL's built-in CheckpointEngineManager.
+    checkpoint_manager_class: llmd_verl.checkpoint_engine_manager.LlmdVerlCheckpointEngineManager
+
+    agent:
+      # Routes generate_sequences() calls to the llm-d HTTP controller instead of
+      # spinning up Ray-managed vLLM processes.
+      agent_loop_manager_class: llmd_verl.agent_loop_manager.LlmdAgentLoopManager
+
+    # ── llm-d controller settings (read by LlmdAgentLoopManager + LlmdVerlCheckpointEngineManager) ──
+    custom:
+      llmd:
+        # K8s service DNS for the llm-d Go controller.
+        # Override with LLMD_CONTROLLER_URL env var or as a CLI override.
+        controller_url: ${oc.env:LLMD_CONTROLLER_URL,http://localhost:8090}
+        http_timeout_s: 600.0
+
+    # ── Sampling parameters ───────────────────────────────────────────────────
+    temperature: 1.0
+    top_k: -1
+    top_p: 1.0
+    response_length: ${data.max_response_length}
+    prompt_length: ${data.max_prompt_length}
+    do_sample: True
+    n: 1
+
+    # val_kwargs is used when meta_info["validate"] is True
+    val_kwargs:
+      _target_: verl.workers.config.SamplingConfig
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      n: 1
+      do_sample: False
+
+    # ── Checkpoint engine (NCCL weight broadcast from FSDP workers to vLLM) ──
+    checkpoint_engine:
+      _target_: verl.workers.config.CheckpointEngineConfig
+      backend: llmd
+
+      # Import this module on every worker process so it registers the "llmd"
+      # backend in CheckpointEngineRegistry before the engine is instantiated.
+      # Worker Ray actors are separate Python processes — driver imports don't
+      # carry over, so we need this explicit hook.
+      custom_backend_module: llmd_verl.checkpoint_engine
+
+      update_weights_bucket_megabytes: 2048
+
+      # kwargs passed through to LlmdNcclCheckpointEngine.__init__
+      engine_kwargs:
+        llmd:
+          controller_url: ${oc.env:LLMD_CONTROLLER_URL,http://localhost:8090}
+          http_timeout_s: 600.0
+
+    # ── Unused rollout-server settings (llm-d owns inference GPUs) ───────────
+    # These are still parsed by the config schema; keep them here to satisfy
+    # Hydra's schema validation even though llm-d ignores them at runtime.
+    name: vllm          # nominal engine name (not used — no veRL rollout actors)
+    mode: async
+    dtype: bfloat16
+    gpu_memory_utilization: 0.0   # no veRL-managed rollout GPUs
+    load_format: dummy
+    tensor_model_parallel_size: 1
+    # Small values: the vLLM engine on the FSDP worker is never actually used for
+    # generation (llm-d handles that), but its initialization/profiling step still
+    # reserves GPU memory.  Keeping these small caps vLLM's profiling footprint.
+    max_num_batched_tokens: 512
+    max_num_seqs: 32
+    log_prob_micro_batch_size_per_gpu: 4
+    log_prob_use_dynamic_bsz: ${actor_rollout_ref.actor.use_dynamic_bsz}
+    log_prob_max_token_len_per_gpu: ${actor_rollout_ref.actor.ppo_max_token_len_per_gpu}
+    disable_log_stats: True
+    enable_chunked_prefill: True
+    free_cache_engine: False      # llm-d controller manages KV cache lifecycle
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Critic
+# ──────────────────────────────────────────────────────────────────────────────
+critic:
+  strategy: fsdp
+  optim:
+    lr: 1e-5
+    lr_warmup_steps_ratio: 0.0
+    min_lr_ratio: null
+    lr_scheduler_type: constant
+    total_training_steps: -1
+  model:
+    path: ${actor_rollout_ref.model.path}
+    tokenizer_path: ${actor_rollout_ref.model.path}
+    # Use Qwen2ForTokenClassification (num_labels=1) as the value head so that
+    # the critic's forward pass produces a [total_nnz, 1] tensor instead of the
+    # full [total_nnz, 151936] causal-LM logit tensor.  The default Qwen2ForCausalLM
+    # head causes all micro-batch logits to be accumulated in memory simultaneously
+    # by postprocess_batch_func, which for a 256-sample batch uses ~80 GB → OOM.
+    override_config:
+      num_labels: 1
+      architectures:
+        - Qwen2ForTokenClassification
+    external_lib: ${actor_rollout_ref.model.external_lib}
+    enable_gradient_checkpointing: True
+    use_remove_padding: False
+    fsdp_config:
+      param_offload: False
+      optimizer_offload: False
+      wrap_policy:
+        min_num_params: 0
+      fsdp_size: -1
+  ppo_mini_batch_size: ${actor_rollout_ref.actor.ppo_mini_batch_size}
+  ppo_micro_batch_size_per_gpu: 4
+  use_dynamic_bsz: ${actor_rollout_ref.actor.use_dynamic_bsz}
+  ppo_max_token_len_per_gpu: 32768
+  # Limit inference micro-batch token count so lm_head output fits in free GPU memory.
+  # At 32768 tokens, lm_head(Qwen2.5) = 9.2 GB → OOM; at 8192 tokens it is ~2.5 GB.
+  ppo_infer_max_token_len_per_gpu: 8192
+  ulysses_sequence_parallel_size: 1
+  ppo_epochs: ${actor_rollout_ref.actor.ppo_epochs}
+  shuffle: ${actor_rollout_ref.actor.shuffle}
+  grad_clip: 1.0
+  cliprange_value: 0.5
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Reward
+# ──────────────────────────────────────────────────────────────────────────────
+reward_model:
+  enable: False
+  strategy: fsdp
+
+custom_reward_function:
+  path: null
+  name: null
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Algorithm
+# ──────────────────────────────────────────────────────────────────────────────
+algorithm:
+  gamma: 1.0
+  lam: 1.0
+  adv_estimator: gae
+  kl_penalty: kl
+  kl_ctrl:
+    type: fixed
+    kl_coef: 0.001
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Trainer
+# ──────────────────────────────────────────────────────────────────────────────
+trainer:
+  total_epochs: 1
+  project_name: verl-llmd
+  experiment_name: gsm8k-qwen2.5-0.5b
+  logger: ['console']
+  # Required: use new engine worker (ActorRolloutRefWorker from engine_workers.py)
+  # which exposes execute_checkpoint_engine for NCCL weight sync with llm-d.
+  use_legacy_worker_impl: disable
+  # Number of steps between validation runs
+  test_freq: 5
+  save_freq: 10
+  default_hdfs_dir: null
+  default_local_dir: /tmp/verl/checkpoints
+  n_gpus_per_node: 1    # FSDP training GPUs per worker node (set to match raycluster.yaml)
+  nnodes: 1             # number of Ray worker nodes with GPUs
