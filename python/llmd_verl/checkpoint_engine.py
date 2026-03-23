@@ -1,236 +1,266 @@
-"""NCCL checkpoint engine for llm-d-rl managed vLLM engines.
+"""Trainer-side NCCL checkpoint engine for llm-d-rl inference pods.
 
-Uses vLLM's StatelessProcessGroup + PyNcclCommunicator to broadcast
-weights directly from the trainer GPU to vLLM engines. The Go controller
-orchestrates the engine-side lifecycle (pause/update_weights/resume)
-via HTTP.
+Registers as "llmd" backend in veRL's CheckpointEngineRegistry so that
+trainer Ray actors broadcast weights directly to llm-d-managed inference
+pods via torch.distributed NCCL, without routing through veRL's rollout
+workers.
 
-Architecture:
-    Trainer GPU (rank 0) --> NCCL broadcast --> vLLM Engine 0 (rank 1)
-                                           --> vLLM Engine 1 (rank 2)
-                                           --> vLLM Engine N (rank N+1)
+Uses vLLM's StatelessProcessGroup + PyNcclCommunicator so the trainer and
+vLLM use the same NCCL initialization protocol (store-based unique_id
+exchange via broadcast_obj).
 
-    Go Controller --> HTTP --> /init_weight_transfer_engine on each engine
-                          --> /update_weights on each engine
+veRL's flow when backend="llmd":
+    engine_workers.py:
+        per_tensor_param, _ = self.actor.engine.get_per_tensor_param()
+        await self.checkpoint_engine.send_weights(per_tensor_param)
+
+    LlmdNcclCheckpointEngine.send_weights():
+        rank 0 -> pynccl.broadcast(tensor, src=0) for each param
+        rank 1..N -> consume the generator (FSDP AllGather still happens)
 """
 
 from __future__ import annotations
 
 import logging
 import socket
-import threading
 import time
-from typing import Generator
+from typing import AsyncGenerator, Generator
 
 import torch
-
-from .client import RolloutControllerClient
-from .config import LlmdRolloutConfig
+from verl.checkpoint_engine.base import CheckpointEngine, CheckpointEngineRegistry
 
 logger = logging.getLogger(__name__)
 
 
-def _get_pod_ip() -> str:
+def _get_local_ip() -> str:
     hostname = socket.gethostname()
     return socket.gethostbyname(hostname)
 
 
-class LlmdCheckpointEngine:
-    """Checkpoint engine that broadcasts weights to llm-d-rl managed vLLM engines.
+@CheckpointEngineRegistry.register("llmd")
+class LlmdNcclCheckpointEngine(CheckpointEngine):
+    """CheckpointEngine that runs on trainer Ray actors and broadcasts to inference pods.
 
-    On the trainer side (is_sender=True):
-        - Creates a StatelessProcessGroup as rank 0
-        - Creates a PyNcclCommunicator for broadcasting
-        - Calls the controller to tell engines to join the NCCL group
-        - broadcast_weights() sends all model params via NCCL
+    Only trainer rank 0 participates in the NCCL group with inference pods.
+    Other FSDP ranks participate in AllGather (to materialize full params)
+    but do not broadcast.
 
-    On the rollout side:
-        - This class is not used. The vLLM engines receive weights directly
-          via their internal WeightTransferEngine, coordinated by the Go controller.
+    Engine-agnostic: uses torch.distributed for NCCL rendezvous and broadcast.
+    Compatible with any inference engine (vLLM, sglang, etc.) managed by the
+    llm-d Go controller.
+
+    Registered as "llmd" backend in CheckpointEngineRegistry.
     """
 
-    def __init__(self, config: LlmdRolloutConfig):
-        self.config = config
-        self.client = RolloutControllerClient(config)
-        self.pynccl = None
-        self.pg = None
-        self.master_address: str | None = None
-        self.master_port = config.master_port
+    def __init__(self, bucket_size: int, is_master: bool = False, **kwargs) -> None:
+        from .config import LlmdRolloutConfig
+        self.is_master = is_master
+        cfg = LlmdRolloutConfig(**kwargs)
+        self.bucket_size = bucket_size  # accepted for interface compat, not used
+        self.controller_url = cfg.controller_url
+        self.master_port = cfg.master_port
+        self.nccl_timeout_s = cfg.nccl_timeout_s
+
+        self.rank: int | None = None
         self.world_size: int | None = None
-        self.weight_version = 0
-        self._initialized = False
+        self._pynccl = None  # PyNcclCommunicator, set in init_process_group
 
-    def init_nccl_group(self) -> None:
-        """Initialize the NCCL group between trainer and all vLLM engines.
+        # Param metadata (names/dtypes/shapes) cached after collect_param_metadata()
+        self._metadata_only: bool = False
+        self._cached_metadata: dict | None = None
 
-        Must be called before the first broadcast_weights() call.
-        This performs the same NCCL rendezvous as llmd_bench.py:
-        1. Start NCCL group creation in a background thread (rank 0)
-        2. Tell the Go controller to init weight transfer on all engines
-        3. Wait for all ranks to join
+    # ------------------------------------------------------------------
+    # CheckpointEngine interface
+    # ------------------------------------------------------------------
+
+    def prepare(self) -> dict | None:
+        """Return local IP:port from every FSDP worker.
+
+        Called on every FSDP worker before rank assignment. The manager
+        collects all results and uses metadata[0] (rank-0 worker's IP:port)
+        as the NCCL rendezvous address; other workers' metadata is ignored.
         """
-        from vllm.distributed.utils import StatelessProcessGroup
-        from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+        ip = _get_local_ip()
+        return {"master_address": ip, "master_port": self.master_port}
 
-        # Determine topology
-        self.master_address = _get_pod_ip()
-        status = self.client.get_pool_status()
-        num_engines = status.get("total_engines", 1)
-        self.world_size = 1 + num_engines
+    @classmethod
+    def build_topology(
+        cls,
+        trainer_world_size: int,
+        rollout_world_size: int,
+        metadata: list[dict],
+    ) -> tuple[dict, dict]:
+        """Build NCCL topology: only trainer rank 0 joins the llm-d group.
 
-        logger.info("NCCL rendezvous: master=%s:%d, world_size=%d",
-                     self.master_address, self.master_port, self.world_size)
+        rollout_world_size here represents the number of inference pods
+        (passed in from LlmdCheckpointEngineManager, not from veRL's
+        rollout workers).
+        """
+        master_meta = metadata[0]  # rank 0's IP:port
+        total_world_size = 1 + rollout_world_size  # rank 0 + inference pods
 
-        # Create NCCL group in background thread (blocks until all ranks connect)
-        nccl_result: list = [None, None]
-        nccl_error: list = [None]
+        trainer_kwargs = {
+            # rank 0 gets slot 0 in the NCCL group; others get -1 (skip)
+            "rank": [0] + [-1] * (trainer_world_size - 1),
+            "world_size": [total_world_size] * trainer_world_size,
+            "master_metadata": [master_meta] * trainer_world_size,
+        }
+        # Inference pods join via HTTP → Go controller, not via veRL worker group
+        rollout_kwargs: dict = {}
+        return trainer_kwargs, rollout_kwargs
 
-        def create_nccl():
-            try:
-                pg = StatelessProcessGroup.create(
-                    host=self.master_address,
-                    port=self.master_port,
-                    rank=0,
-                    world_size=self.world_size,
-                )
-                pynccl = PyNcclCommunicator(pg, device=torch.device("cuda:0"))
-                nccl_result[0] = pynccl
-                nccl_result[1] = pg
-            except Exception as e:
-                nccl_error[0] = e
+    def init_process_group(
+        self,
+        rank: int,
+        world_size: int,
+        master_metadata: dict,
+    ) -> None:
+        """Initialize NCCL group.  rank<0 means this worker is not rank 0."""
+        self.rank = rank
+        self.world_size = world_size
 
-        nccl_thread = threading.Thread(target=create_nccl, daemon=True)
-        nccl_thread.start()
-        time.sleep(1)  # Let trainer start listening before engines connect
+        if rank < 0:
+            # Non-zero FSDP worker: skip NCCL group, just set rank
+            return
 
-        # Tell controller to init weight transfer on all engines concurrently
-        self.client.init_weight_transfer(
-            master_address=self.master_address,
-            master_port=self.master_port,
-            world_size=self.world_size,
-            backend=self.config.weight_sync_backend,
+        master_address = master_metadata["master_address"]
+        master_port = master_metadata["master_port"]
+
+        logger.info(
+            "LlmdNcclCheckpointEngine: rank=0 NCCL rendezvous at %s:%d, world_size=%d",
+            master_address, master_port, world_size,
         )
 
-        nccl_thread.join(timeout=self.config.nccl_timeout_s)
+        # Use vLLM's StatelessProcessGroup so the trainer and vLLM pods use
+        # the same NCCL init protocol: store-based broadcast_obj for unique_id
+        # exchange, then PyNcclCommunicator for actual tensor transfer.
+        import os
+        os.environ.setdefault("NCCL_DEBUG", "INFO")
+        os.environ.setdefault("NCCL_SOCKET_IFNAME", "eth0")
 
-        if nccl_error[0]:
-            raise RuntimeError(f"NCCL group setup failed: {nccl_error[0]}")
+        logger.info(
+            "CUDA available=%s initialized=%s device_count=%s current_device=%s",
+            torch.cuda.is_available(),
+            torch.cuda.is_initialized(),
+            torch.cuda.device_count() if torch.cuda.is_available() else 0,
+            torch.cuda.current_device() if torch.cuda.is_available() else "N/A",
+        )
+        logger.info(
+            "CUDA_VISIBLE_DEVICES=%s NCCL_SOCKET_IFNAME=%s NCCL_DEBUG=%s",
+            os.environ.get("CUDA_VISIBLE_DEVICES", "not set"),
+            os.environ.get("NCCL_SOCKET_IFNAME", "not set"),
+            os.environ.get("NCCL_DEBUG", "not set"),
+        )
 
-        self.pynccl, self.pg = nccl_result
-        self._initialized = True
-        logger.info("NCCL group established: %d ranks", self.world_size)
-
-    def broadcast_weights(self, model: torch.nn.Module,
-                          device: torch.device | None = None) -> float:
-        """Broadcast all model parameters via NCCL to all engines.
-
-        This performs the actual GPU-to-GPU tensor transfer. The Go controller
-        coordinates the engine-side lifecycle separately.
-
-        Args:
-            model: The model whose parameters to broadcast.
-            device: CUDA device to use. Defaults to cuda:0.
-
-        Returns:
-            Wall-clock time of the NCCL broadcast in seconds.
-        """
-        if not self._initialized:
-            raise RuntimeError("Call init_nccl_group() before broadcast_weights()")
-
-        if device is None:
-            device = torch.device("cuda:0")
-
-        start = time.perf_counter()
-        stream = torch.cuda.Stream(device=device)
-        with torch.cuda.stream(stream):
-            for name, param in model.named_parameters():
-                tensor = param.data.contiguous()
-                self.pynccl.broadcast(tensor, src=0, stream=stream)
-        stream.synchronize()
-        elapsed = time.perf_counter() - start
-
-        logger.info("NCCL broadcast complete: %.3fs", elapsed)
-        return elapsed
-
-    def broadcast_tensors(self, params: Generator[tuple[str, torch.Tensor], None, None],
-                          device: torch.device | None = None) -> float:
-        """Broadcast tensors from a generator (veRL's weight generator pattern).
-
-        Args:
-            params: Generator yielding (name, tensor) pairs.
-            device: CUDA device. Defaults to cuda:0.
-
-        Returns:
-            Wall-clock time of the NCCL broadcast in seconds.
-        """
-        if not self._initialized:
-            raise RuntimeError("Call init_nccl_group() before broadcast_tensors()")
-
-        if device is None:
-            device = torch.device("cuda:0")
-
-        start = time.perf_counter()
-        stream = torch.cuda.Stream(device=device)
-        with torch.cuda.stream(stream):
-            for name, tensor in params:
-                t = tensor.contiguous()
-                self.pynccl.broadcast(t, src=0, stream=stream)
-        stream.synchronize()
-        elapsed = time.perf_counter() - start
-
-        logger.info("NCCL broadcast complete: %.3fs", elapsed)
-        return elapsed
-
-    def sync_weights(self, model: torch.nn.Module,
-                     device: torch.device | None = None) -> int:
-        """Full weight sync: NCCL broadcast + controller update lifecycle.
-
-        This is the high-level method that performs the complete weight sync:
-        1. Start NCCL broadcast in a background thread
-        2. Tell the controller to orchestrate pause -> update_weights -> resume
-        3. Wait for broadcast to complete
-        4. Increment and return the new weight version
-
-        Args:
-            model: The model whose parameters to broadcast.
-            device: CUDA device. Defaults to cuda:0.
-
-        Returns:
-            The new weight version after sync.
-        """
-        if not self._initialized:
-            self.init_nccl_group()
-
-        self.weight_version += 1
-
-        # Start NCCL broadcast in background
-        broadcast_error: list = [None]
-        broadcast_elapsed: list = [0.0]
-
-        def do_broadcast():
+        # Pin vLLM to use the nvidia pip NCCL (same library as the vLLM engine pod).
+        # Both sides must use the same NCCL version for ncclCommInitRank to succeed.
+        _site = os.path.dirname(torch.__file__)
+        _nvidia_nccl = os.path.normpath(
+            os.path.join(_site, "..", "nvidia", "nccl", "lib", "libnccl.so.2")
+        )
+        if os.path.exists(_nvidia_nccl):
+            os.environ["VLLM_NCCL_SO_PATH"] = _nvidia_nccl
             try:
-                time.sleep(0.5)  # Let controller start pause/update lifecycle
-                broadcast_elapsed[0] = self.broadcast_weights(model, device)
-            except Exception as e:
-                broadcast_error[0] = e
+                import vllm.envs as _vllm_envs
+                _vllm_envs.VLLM_NCCL_SO_PATH = _nvidia_nccl
+            except Exception:
+                pass
+            print(f"[LLMD DEBUG] Pinned VLLM_NCCL_SO_PATH={_nvidia_nccl}", flush=True)
+        else:
+            print("[LLMD DEBUG] nvidia pip NCCL not found, using default", flush=True)
 
-        broadcast_thread = threading.Thread(target=do_broadcast, daemon=True)
-        broadcast_thread.start()
+        from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+        from vllm.distributed.utils import StatelessProcessGroup
 
-        # Tell controller to orchestrate the engine-side lifecycle
-        self.client.update_weights_from_model(self.weight_version, model)
+        print(f"[LLMD DEBUG] TRAINER rank=0 creating StatelessProcessGroup: host={master_address} port={master_port} world_size={world_size}", flush=True)
+        pg = StatelessProcessGroup.create(
+            host=master_address,
+            port=master_port,
+            rank=0,
+            world_size=world_size,
+            store_timeout=int(self.nccl_timeout_s),
+        )
+        print(f"[LLMD DEBUG] TRAINER rank=0 StatelessProcessGroup created, wrapping broadcast_obj", flush=True)
 
-        broadcast_thread.join(timeout=self.config.nccl_timeout_s)
-        if broadcast_error[0]:
-            raise RuntimeError(f"NCCL broadcast failed: {broadcast_error[0]}")
+        # Monkey-patch broadcast_obj to trace the unique_id exchange
+        _orig_broadcast_obj = pg.broadcast_obj
+        def _debug_broadcast_obj(obj, src):
+            import pickle
+            print(f"[LLMD DEBUG] TRAINER broadcast_obj ENTER: src={src} type={type(obj).__name__} hex={pickle.dumps(obj).hex()[:32]}", flush=True)
+            result = _orig_broadcast_obj(obj, src)
+            print(f"[LLMD DEBUG] TRAINER broadcast_obj EXIT: src={src}", flush=True)
+            return result
+        pg.broadcast_obj = _debug_broadcast_obj
 
-        logger.info("Weight sync complete: version=%d, nccl=%.3fs",
-                     self.weight_version, broadcast_elapsed[0])
-        return self.weight_version
+        print(f"[LLMD DEBUG] TRAINER calling PyNcclCommunicator (world_size={world_size}) — will block in ncclCommInitRank until vLLM joins", flush=True)
+        self._pynccl = PyNcclCommunicator(pg, device=torch.cuda.current_device())
+        print(f"[LLMD DEBUG] TRAINER PyNcclCommunicator DONE — ncclCommInitRank + warmup all_reduce completed", flush=True)
+
+        logger.info("LlmdNcclCheckpointEngine: NCCL group established")
 
     def finalize(self) -> None:
-        """Clean up resources."""
-        self.pynccl = None
-        self.pg = None
-        self._initialized = False
+        """Release NCCL resources (called after each update in rebuild_group mode)."""
+        self._pynccl = None
+        self.rank = None
         torch.cuda.empty_cache()
+
+    async def send_weights(
+        self, weights: Generator[tuple[str, torch.Tensor], None, None]
+    ) -> None:
+        """Broadcast all parameters to inference pods via NCCL.
+
+        Rank 0 broadcasts; other ranks consume the generator (required to
+        complete FSDP AllGather on non-rank-0 workers).
+        """
+        if self.rank is None:
+            raise RuntimeError("init_process_group() must be called before send_weights()")
+
+        if self.rank < 0:
+            # Drain generator so FSDP AllGather completes on this worker
+            for _name, _tensor in weights:
+                pass
+            return
+
+        # Rank 0: optionally collect metadata, then broadcast
+        start = time.perf_counter()
+        count = 0
+        stream = torch.cuda.current_stream()
+        names, dtypes, shapes = [], [], []
+        for name, tensor in weights:
+            if self._cached_metadata is None:
+                names.append(name)
+                dtypes.append(str(tensor.dtype).replace("torch.", ""))
+                shapes.append(list(tensor.shape))
+            if self._metadata_only:
+                count += 1
+                continue
+            t = tensor.contiguous()
+            if not t.is_cuda:
+                t = t.cuda()
+            self._pynccl.broadcast(t, src=0, stream=stream)
+            count += 1
+        if self._cached_metadata is None and names:
+            self._cached_metadata = {
+                "param_names": names,
+                "param_dtypes": dtypes,
+                "param_shapes": shapes,
+            }
+        if not self._metadata_only:
+            torch.cuda.synchronize()
+        elapsed = time.perf_counter() - start
+        logger.info("send_weights: %s %d tensors in %.3fs",
+                    "collected metadata for" if self._metadata_only else "broadcast",
+                    count, elapsed)
+
+    def set_metadata_only(self, enabled: bool) -> None:
+        """Enable/disable metadata-only mode (skips NCCL broadcast, captures param info)."""
+        self._metadata_only = enabled
+
+    def get_cached_metadata(self) -> dict | None:
+        """Return cached param metadata after collect_param_metadata() completes."""
+        return self._cached_metadata
+
+    async def receive_weights(self) -> AsyncGenerator[tuple[str, torch.Tensor], None]:
+        raise NotImplementedError(
+            "Inference pods receive weights via the Go controller, not this engine"
+        )
