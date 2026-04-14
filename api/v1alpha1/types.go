@@ -103,7 +103,10 @@ type GenerateRequest struct {
 
 // GenerateResponse contains the output of a generation request.
 type GenerateResponse struct {
-	// OutputTokenIDs is the generated token sequence.
+	// Text is the generated text (set when routed through EPP/inference router).
+	Text string `json:"text,omitempty"`
+
+	// OutputTokenIDs is the generated token sequence (set for direct engine dispatch).
 	OutputTokenIDs []int32 `json:"output_token_ids"`
 
 	// Logprobs contains per-token log probabilities (if requested).

@@ -156,14 +156,20 @@ func (s *Server) discoverModelName(ctx context.Context, baseURL string) string {
 //   - req.PromptTokenIDs (int array): sent as "prompt" for the direct
 //     engine path. vLLM's /v1/completions endpoint accepts token ID
 //     arrays natively.
-func (s *Server) buildOAIRequest(ctx context.Context, baseURL string, req *v1alpha1.GenerateRequest) ([]byte, error) {
+func (s *Server) buildOAIRequest(ctx context.Context, baseURL string, req *v1alpha1.GenerateRequest, infRouterMode bool) ([]byte, error) {
 	oaiReq := map[string]interface{}{
 		"model": s.discoverModelName(ctx, baseURL),
 	}
-	if req.Prompt != "" {
-		// Router path: send the actual text prompt so the inference
-		// scheduler can tokenize it for prefix-cache routing.
-		oaiReq["prompt"] = req.Prompt
+	if infRouterMode {
+		// Send the decoded prompt text so the inference router can parse and
+		// route correctly. Also send prompt_token_ids for forward-compatibility
+		// with vLLM versions that prefer token IDs over re-tokenizing text.
+		if req.Prompt != "" {
+			oaiReq["prompt"] = req.Prompt
+		}
+		if req.PromptTokenIDs != nil {
+			oaiReq["prompt_token_ids"] = req.PromptTokenIDs
+		}
 	} else {
 		// Direct-to-engine: vLLM accepts prompt as an int array natively.
 		oaiReq["prompt"] = req.PromptTokenIDs
@@ -193,7 +199,7 @@ func (s *Server) buildOAIRequest(ctx context.Context, baseURL string, req *v1alp
 }
 
 // parseOAIResponse parses an OpenAI /v1/completions response body.
-func parseOAIResponse(respBody []byte) (*v1alpha1.GenerateResponse, error) {
+func parseOAIResponse(respBody []byte, infRouterMode bool) (*v1alpha1.GenerateResponse, error) {
 	var oaiResp struct {
 		Choices []struct {
 			Text         string `json:"text"`
@@ -210,8 +216,12 @@ func parseOAIResponse(respBody []byte) (*v1alpha1.GenerateResponse, error) {
 	if len(oaiResp.Choices) > 0 {
 		choice := oaiResp.Choices[0]
 		resp.FinishReason = choice.FinishReason
-		for _, c := range choice.Text {
-			resp.OutputTokenIDs = append(resp.OutputTokenIDs, int32(c))
+		if infRouterMode {
+			resp.Text = choice.Text
+		} else {
+			for _, c := range choice.Text {
+				resp.OutputTokenIDs = append(resp.OutputTokenIDs, int32(c))
+			}
 		}
 		if choice.Logprobs != nil {
 			resp.Logprobs = choice.Logprobs.TokenLogprobs
@@ -223,8 +233,8 @@ func parseOAIResponse(respBody []byte) (*v1alpha1.GenerateResponse, error) {
 // postCompletions is the shared implementation for both router and direct-engine
 // dispatch. It builds the OAI request body, POSTs to baseURL/v1/completions,
 // applies any caller-supplied extra headers, and parses the response.
-func (s *Server) postCompletions(ctx context.Context, baseURL string, req *v1alpha1.GenerateRequest, extraHeaders map[string]string) (*v1alpha1.GenerateResponse, error) {
-	body, err := s.buildOAIRequest(ctx, baseURL, req)
+func (s *Server) postCompletions(ctx context.Context, baseURL string, req *v1alpha1.GenerateRequest, extraHeaders map[string]string, infRouterMode bool) (*v1alpha1.GenerateResponse, error) {
+	body, err := s.buildOAIRequest(ctx, baseURL, req, infRouterMode)
 	if err != nil {
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
@@ -252,7 +262,7 @@ func (s *Server) postCompletions(ctx context.Context, baseURL string, req *v1alp
 	if httpResp.StatusCode >= 400 {
 		return nil, fmt.Errorf("POST %s/v1/completions returned %d: %s", baseURL, httpResp.StatusCode, string(respBody))
 	}
-	return parseOAIResponse(respBody)
+	return parseOAIResponse(respBody, infRouterMode)
 }
 
 // forwardToRouter sends a GenerateRequest to the inference router gateway.
@@ -264,14 +274,14 @@ func (s *Server) forwardToRouter(ctx context.Context, req *v1alpha1.GenerateRequ
 	if req.SessionID != "" {
 		headers["X-Session-ID"] = req.SessionID
 	}
-	return s.postCompletions(ctx, s.routerURL, req, headers)
+	return s.postCompletions(ctx, s.routerURL, req, headers, true)
 }
 
 // forwardToEngine sends a GenerateRequest directly to a vLLM engine.
 // The request's PromptTokenIDs are passed directly in "prompt" as an int
 // array, which vLLM accepts natively.
 func (s *Server) forwardToEngine(ctx context.Context, engine *lifecycle.EngineInfo, req *v1alpha1.GenerateRequest) (*v1alpha1.GenerateResponse, error) {
-	return s.postCompletions(ctx, engine.Address, req, nil)
+	return s.postCompletions(ctx, engine.Address, req, nil, false)
 }
 
 func (s *Server) handleAbortGeneration(w http.ResponseWriter, r *http.Request) {
