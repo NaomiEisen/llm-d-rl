@@ -239,17 +239,6 @@ spec:
       spec:
         # No node pinning: the GPU request anchors this worker and the head follows.
         # Do not add affinity back to the head - mutual required affinity deadlocks.
-        # Exclude nodes with known-faulty GPUs (device plugin "GPU is lost" admission
-        # errors) so the scheduler does not keep retrying them. Add hostnames as needed.
-        affinity:
-          nodeAffinity:
-            requiredDuringSchedulingIgnoredDuringExecution:
-              nodeSelectorTerms:
-              - matchExpressions:
-                - key: kubernetes.io/hostname
-                  operator: NotIn
-                  values:
-                  - excluded-node
         # Extracts the pd-sidecar binary into llm-d-bins for the replicas to launch
         # (VERL_SIDECAR_BINARY). Bump the tag in deploy.env and recreate to change.
         initContainers:

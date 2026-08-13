@@ -15,24 +15,6 @@ spec:
       num-gpus: "4"
     template:
       spec:
-        affinity:
-          nodeAffinity:
-            requiredDuringSchedulingIgnoredDuringExecution:
-              nodeSelectorTerms:
-              - matchExpressions:
-                # Exclude known-faulty nodes. Add hostnames as needed.
-                - key: kubernetes.io/hostname
-                  operator: NotIn
-                  values:
-                  - excluded-node
-                  - pokprod-b93r44s0
-                # Uncomment to pin to specific nodes (e.g. a GPU island).
-                # - key: kubernetes.io/hostname
-                #   operator: In
-                #   values:
-                #   - gpu-node-1
-                #   - gpu-node-2
-
         initContainers:
         - name: fetch-binaries
           image: ${IMG_CRANE}

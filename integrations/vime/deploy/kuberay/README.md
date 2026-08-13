@@ -26,9 +26,6 @@ Images are defined in `deploy.env` - edit tags there rather than in the manifest
 
 If needed, adjust the manifest:
 - **GPU count** - `resources.limits.nvidia.com/gpu` defaults to 4; edit to match your node
-- **Node placement** - `nodeAffinity` has two knobs:
-  - `NotIn` - exclude known-faulty nodes; replace the placeholder hostnames with your own
-  - `In` - pin to specific nodes; uncomment the block and add the target hostnames
 
 ## Step 2 - Deploy
 
